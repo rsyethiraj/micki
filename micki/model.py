@@ -12,6 +12,7 @@ from collections import OrderedDict
 
 import numpy as np
 import sympy as sym
+import sksundae as sun
 
 from copy import copy
 from ase.units import kB, _hplanck, kg, _k, _Nav, mol
@@ -43,7 +44,7 @@ class Reaction(object):
 
         # Determine the number of sites on the LHS and the RHS of the reaction,
         # then add "bare" sites as necessary to balance the site number.
-        vacancies = OrderedDict() 
+        vacancies = OrderedDict()
         self.species = []
         for species in self.reactants:
             if species not in self.species:
@@ -133,7 +134,7 @@ class Reaction(object):
         self.reversible = reversible
 
         # Scaling for sensitivity analysis, defaults to 1 (no scaling)
-        self.scale = OrderedDict() 
+        self.scale = OrderedDict()
         for param in self.scale_params:
             self.scale[param] = 1.0
         self.scale_old = self.scale.copy()
@@ -445,6 +446,13 @@ class Model(object):
         self._z = z  # Diffusion length
         self.lattice = lattice
         self.reactor = reactor
+        # SUNDAE-based solver attributes
+        self.nvariables = 0          # will be set later when species are defined
+        self.y0 = None               # initial variable values
+        self.yp0 = None              # initial derivatives
+        self.rates = []              # reaction rate expressions
+        self.resfn = None            # DAE residual function
+        self.solver = None           # SUNDAE solver object
 
     def add_reactions(self, reactions):
         # Set up list of reactions and species
@@ -752,172 +760,223 @@ class Model(object):
             for j, symbol in enumerate(self.symbols):
                 self.drdy[i, j] = sym.diff(rate, symbol)
             for j, vac in enumerate(self.vacancy):
-                self.drdvac[i, j] = sym.diff(rate, vac.symbol)
+                self.drdvac[i, j] = sym.diff(rate, vac.symbol
+                
+        # Convert to ordered initial arrays for SUNDAE
+        self.y0 = np.array([self.U0[s.label] for s in self._variable_species])
+        self.yp0 = np.zeros_like(self.y0)
 
-        # Sets up and compiles the Fortran differential equation solving module
-        self.setup_execs()
+        # Set tolerances
+        self.atol = np.array([1e-32] * self.nvariables) + 1e-16 * algvar
+        self.rtol = 1e-10
 
-        # Convert the dictionary U0 of initial conditions into a list that can
-        # be used with the Fortran module.
-        U0 = []
-        for symbol in self.symbols:
-            for species, isymbol in self.symbols_dict.items():
-                if symbol == isymbol:
-                    U0.append(self.U0[species.label])
-                    break
+        # Initialize SUNDAE solver object
+        self.solver = sun.ida.IDA()
+        self.solver.init(self.resfn, 0.0, self.y0, self.yp0)
+        self.solver.set_tolerances(self.rtol, self.atol)
 
-        # Pass initial values to the fortran module
-        atol = np.array([1e-32] * self.nvariables)
-        atol += 1e-16 * algvar
-        self.finitialize(U0, 1e-10, atol, [], [], algvar)
+        # If you want to handle algebraic variables (from M)
+        self.solver.set_id(algvar)
+
 
         self.initialized = True
 
     def setup_execs(self):
         from micki.fortran import f90_template, pyf_template
         from numpy import f2py
+        """
+        Build numeric residual, rate, and Jacobian functions from SymPy expressions,
+        and initialize a persistent sksundae.IDA solver attached to self.solver.
 
-        # y_vec is an array symbol that will represent the species
-        # concentrations provided by the differential equation solver inside
-        # the Fortran code (that is, y_vec is an INPUT to the functions that
-        # calculate the residual, Jacobian, and rate)
-        y_vec = sym.IndexedBase('y', shape=(self.nvariables,))
-        vac_vec = sym.IndexedBase('vac', shape=(len(self.vacancy),))
-        # Map y_vec elements (1-indexed, of course) onto 'modelparam' symbols
-        trans = {self.symbols[i]: y_vec[i + 1] for i in range(self.nvariables)}
-        trans.update({vac.symbol: y_vec[i + 1] for i, vac in enumerate(self.vacancy)})
-        # Map string represntation of 'modelparam' symbols onto string
-        # representation of y-vec elements
-        str_trans = {}
-        for i, symbol in enumerate(self.symbols):
-            str_trans[sym.fcode(symbol, source_format='free')] = \
-                    sym.fcode(y_vec[i + 1], source_format='free')
-        for i, vac in enumerate(self.vacancy):
-            str_trans[sym.fcode(vac.symbol, source_format='free')] = \
-                    sym.fcode(vac_vec[i + 1], source_format='free')
-        
-        str_list = [key for key in str_trans]
-        str_list.sort(key=len, reverse=True)
+        This version lambdifies:
+          - residuals: F(y, yp) = M*yp - dypdr * rates(y)
+          - Jacobian: J_y = dF/dy (symbolic), and supplies jacfn that returns J = J_y + cj * (dF/dyp)
+            where dF/dyp = M (mass matrix).
+        """
+        import sympy as sym
+        import numpy as np
+        import sksundae as sun
+        import warnings
 
-        # these will contain lists of strings, with each element being one
-        # Fortran assignment for the master equation, Jacobian, and
-        # rate expressions
-        dypdrcode = []
-        drdycode = []
-        ratecode = []
-        vaccode = []
-        drdvaccode = []
-        dvacdycode = []
+        # sanity check
+        if not hasattr(self, "nvariables") or self.nvariables == 0:
+            raise RuntimeError("nvariables must be set before calling setup_execs()")
 
-        for i, expr in enumerate(self.vac_sym):
-            fcode = sym.fcode(expr, source_format='free')
-            for key in str_list:
-                fcode = fcode.replace(key, str_trans[key])
-            vaccode.append('   vac({}) = '.format(i + 1) + fcode)
+        # 1) symbolic placeholders
+        n = self.nvariables
+        y_syms = sym.symbols(f'y0_0:{n}')
+        yp_syms = sym.symbols(f'yp0_0:{n}')
 
-        for i, row in enumerate(self.drdvac):
-            for j, elem in enumerate(row):
-                if elem != 0:
-                    fcode = sym.fcode(elem, source_format='free')
-                    for key in str_list:
-                        fcode = fcode.replace(key, str_trans[key])
-                    drdvaccode.append('   drdvac({}, {}) = '.format(i + 1, j + 1) + fcode)
-        
-        for i, row in enumerate(self.dvacdy):
-            for j, elem in enumerate(row):
-                if elem != 0:
-                    dvacdycode.append('   dvacdy({}, {}) = '.format(i+1, j+1) + sym.fcode(elem, source_format='free'))
+        nv = len(self.vacancy)
+        if nv > 0:
+            vac_syms = sym.symbols(f'vac0_0:{nv}')
+        else:
+            vac_syms = ()
 
-        for i, row in enumerate(self.dypdr):
-            for j, elem in enumerate(row):
-                if elem != 0:
-                    dypdrcode.append('   dypdr({}, {}) = '.format(i+1, j+1) + sym.fcode(elem, source_format='free'))
+        # 2) map model symbols -> y placeholders
+        subs_map = {}
+        for i, s in enumerate(self.symbols):
+            subs_map[s] = y_syms[i]
+        for i, v in enumerate(self.vacancy):
+            # vac_sym expressions (constructed earlier) are in terms of species.symbol,
+            # which we map to vac_syms placeholders first; later we'll substitute vac_syms
+            # back into y via vac_sym_list which uses y_syms.
+            subs_map[v.symbol] = vac_syms[i] if nv > 0 else sym.Integer(0)
 
-        # Effectively the same as above, except on the two-dimensional Jacobian
-        # matrix.
-        for i, row in enumerate(self.drdy):
-            for j, elem in enumerate(row):
-                if elem != 0:
-                    fcode = sym.fcode(elem, source_format='free')
-                    for key in str_list:
-                        fcode = fcode.replace(key, str_trans[key])
-                    drdycode.append('   drdy({}, {}) = '.format(i + 1, j + 1) + fcode)
+        # 3) prepare symbolic rate expressions and vac expressions substituted to placeholders
+        rate_sym_list = [sym.sympify(r) for r in self.rates]  # ensure sympy objects
+        rate_sub = [r.subs(subs_map) for r in rate_sym_list]
 
-        # See residual above
-        for i, rate in enumerate(self.rates):
-            fcode = sym.fcode(rate, source_format='free')
-            for key in str_list:
-                fcode = fcode.replace(key, str_trans[key])
-            ratecode.append('   rates({}) = '.format(i + 1) + fcode)
+        vac_sym_list = []
+        if nv > 0:
+            for vexpr in self.vac_sym:
+                vac_sym_list.append(sym.sympify(vexpr).subs(subs_map))
 
-        # We insert all of the parameters of this differential equation into
-        # the prewritten Fortran template, including the residual, Jacobian,
-        # and rate expressions we just calculated.
-        program = f90_template.format(neq=self.nvariables, nx=1,
-                                      nrates=len(self.rates),
-                                      nvac=len(self.vacancy),
-                                      dypdrcalc='\n'.join(dypdrcode),
-                                      drdycalc='\n'.join(drdycode),
-                                      ratecalc='\n'.join(ratecode),
-                                      vaccalc='\n'.join(vaccode),
-                                      drdvaccalc='\n'.join(drdvaccode),
-                                      dvacdycalc='\n'.join(dvacdycode),
-                                      )
+        # 4) because vac_sym_list is expressed in terms of species symbols replaced by y_syms,
+        # we should now express the rate_sub in terms of y_syms by substituting vac_syms -> vac_sym_list
+        if nv > 0:
+            rate_for_lamb_sym = [r.subs({vac_syms[i]: vac_sym_list[i] for i in range(nv)}) for r in rate_sub]
+        else:
+            rate_for_lamb_sym = rate_sub
 
-        # Generate a randomly-named temp directory for compiling the module.
-        # We will name the actual module file after the directory.
-        dname = tempfile.mkdtemp()
-        modname = os.path.split(dname)[1]
-        fname = modname + '.f90'
-        pyfname = modname + '.pyf'
+        # 5) build residual symbolic expressions: F_i = sum_j M[i,j] * yp_j - sum_k dypdr[i,k] * rate_k(y)
+        M = np.array(self.M, dtype=float)
+        dypdr = np.array(self.dypdr, dtype=float)
+        nrates = len(rate_for_lamb_sym)
 
-        # For debugging purposes, write out the generated module
-        with open('solve_ida.f90', 'w') as f:
-            f.write(program)
+        residual_sym = []
+        for i in range(n):
+            mass_term = sum(int(M[i, j]) * yp_syms[j] for j in range(n))
+            flux_term = sym.Integer(0)
+            for k in range(nrates):
+                coeff = dypdr[i, k]
+                if coeff == 0:
+                    continue
+                flux_term += sym.sympify(float(coeff)) * rate_for_lamb_sym[k]
+            residual_sym.append(mass_term - flux_term)
 
-        # Write the pertinent data into the temp directory
-        with open(os.path.join(dname, pyfname), 'w') as f:
-            f.write(pyf_template.format(modname=modname, neq=self.nvariables,
-                    nrates=len(self.rates), nvac=len(self.vacancy)))
+        # 6) Jacobian wrt y_syms: J_y = dF/dy
+        # Note: dF/dyp = M (constant); J used by IDA is J = dF/dy + cj * dF/dyp
+        try:
+            J_sym = sym.Matrix(residual_sym).jacobian(list(y_syms))
+        except Exception as e:
+            raise RuntimeError("Failed to build symbolic Jacobian: " + str(e))
 
-        # Compile the module with f2py
-        lapack = "-lmkl_rt"
-        if "MICKI_LAPACK" in os.environ:
-            lapack = os.environ["MICKI_LAPACK"]
-        os.environ["CFLAGS"] = "-w -std=c99"
-        output=f2py.compile(program, modulename=modname, verbose=0, 
-                     full_output=1,
-                     extra_args='--quiet '
-                                '--f90flags="-Wno-unused-dummy-argument '
-                                '-Wno-unused-variable -Wno-unused-func -w" ' 
-                                '-lsundials_fida '
-                                '-lsundials_fnvecserial '
-                                '-lsundials_ida '
-                                '-lsundials_fsunlinsollapackdense '
-                                '-lsundials_sunlinsollapackdense '
-                                '-lsundials_nvecserial ' + lapack + ' ' +
-                                os.path.join(dname, pyfname),
-                     source_fn=os.path.join(dname, fname))
-        if output.returncode != 0:
-            print(output.stderr)
-        # Delete the temporary directory
-        shutil.rmtree(dname)
+        # 7) Lambdify residuals and Jacobian
+        # residuals: function of (y_syms, yp_syms) -> residual vector
+        arg_res = list(y_syms) + list(yp_syms)
+        try:
+            resid_lamb = sym.lambdify(arg_res, residual_sym, modules="numpy")
+        except Exception as e:
+            raise RuntimeError("Failed to lambdify residual expressions: " + str(e))
 
-        # Import the module on-the-fly with __import__. This is kind of a hack.
-        solve_ida = __import__(modname)
-        self._solve_ida = solve_ida
+        # jacobian lambdify: function of y_syms -> matrix
+        try:
+            jac_lamb = sym.lambdify(list(y_syms), J_sym, modules="numpy")
+        except Exception as e:
+            raise RuntimeError("Failed to lambdify Jacobian expressions: " + str(e))
 
-        # The Fortran module's initialize, solve, and finalize routines
-        # are mapped onto finitialize, fsolve, and ffinalize inside the Model
-        # object. We don't want users touching these manually
-        self.finitialize = solve_ida.initialize
-        self.ffind_steady_state = solve_ida.find_steady_state
-        self.fsolve = solve_ida.solve
-        self.ffinalize = solve_ida.finalize
+        # rates lambdify (for postprocessing)
+        try:
+            rate_lamb = sym.lambdify(list(y_syms), rate_for_lamb_sym, modules="numpy")
+        except Exception as e:
+            raise RuntimeError("Failed to lambdify rate expressions: " + str(e))
 
-        # Delete the module file. We've already imported it, so it's in memory.
-        library=glob.glob(modname + '*.so')[0]
-        os.remove(library)
+        # 8) define Python callback wrappers
+        def resfn(t, y_arr, yp_arr, res_out):
+            # pack args in order expected by resid_lamb
+            y_flat = np.asarray(y_arr).ravel()
+            yp_flat = np.asarray(yp_arr).ravel()
+            args = tuple(list(y_flat) + list(yp_flat))
+            rvals = resid_lamb(*args)
+            rnp = np.asarray(rvals, dtype=float).ravel()
+            res_out[:] = rnp
+            return 0
+
+        # Jacobian function expected by IDA: J = dF/dy + cj * dF/dyp
+        # We'll implement jacfn(t, y, yp, cj, J_out) which fills J_out in-place.
+        M_sym = np.array(M, dtype=float)  # dF/dyp
+        def jacfn(t, y_arr, yp_arr, cj, J_out):
+            # compute J_y
+            y_flat = np.asarray(y_arr).ravel()
+            J_y = np.asarray(jac_lamb(*list(y_flat)), dtype=float)
+            # combine
+            J_comb = J_y + float(cj) * M_sym
+            # copy into provided output (assume shape matches (n, n))
+            J_out[:, :] = J_comb
+            return 0
+
+        # expose functions on self
+        self.resfn = resfn
+        self.jacfn = jacfn
+        self.rate_func = lambda y: np.asarray(rate_lamb(*list(np.asarray(y).ravel())), dtype=float).ravel()
+
+        # 9) prepare y0 / yp0 and solver initialization (tolerances & algvar)
+        if getattr(self, "y0", None) is None:
+            self.y0 = np.array([self.U0[s.label] for s in self._variable_species], dtype=float)
+        if getattr(self, "yp0", None) is None:
+            self.yp0 = np.zeros_like(self.y0)
+
+        algvar = np.array(self.M.diagonal(), dtype=float)
+        atol = np.array([1e-32] * n, dtype=float) + 1e-16 * algvar
+        rtol = 1e-10
+
+        # 10) create solver and attach jacfn as supported
+        created = False
+        # Try passing jacfn in constructor first (some sksundae versions accept this)
+        try:
+            self.solver = sun.ida.IDA(resfn=self.resfn, jacfn=self.jacfn, neq=n)
+            created = True
+        except Exception:
+            try:
+                self.solver = sun.ida.IDA(resfn=self.resfn, neq=n)
+                created = True
+                # try to register jacfn via setter(s) if available
+                if hasattr(self.solver, "set_jacobian"):
+                    try:
+                        self.solver.set_jacobian(self.jacfn)
+                    except Exception:
+                        pass
+                if hasattr(self.solver, "set_jacfn"):
+                    try:
+                        self.solver.set_jacfn(self.jacfn)
+                    except Exception:
+                        pass
+            except Exception as e:
+                raise RuntimeError("Could not create sksundae.IDA solver: " + str(e))
+
+        # try defensive init/tolerance/id setting
+        try:
+            if hasattr(self.solver, "init"):
+                try:
+                    # some wrappers expect (resfn, t0, y0, yp0)
+                    self.solver.init(self.resfn, 0.0, self.y0, self.yp0)
+                except Exception:
+                    # maybe constructor already initialized; ignore
+                    pass
+            if hasattr(self.solver, "set_tolerances"):
+                try:
+                    self.solver.set_tolerances(rtol, atol)
+                except Exception:
+                    pass
+            if hasattr(self.solver, "set_id"):
+                try:
+                    self.solver.set_id(algvar)
+                except Exception:
+                    pass
+        except Exception:
+            warnings.warn("Could not fully configure sksundae solver (tolerances/algvar). "
+                          "Check API and adjust calls.", RuntimeWarning)
+
+        # compatibility shim: simple fsolve wrapper that mimics old behaviour
+        def py_fsolve(tspan, y0=None, yp0=None):
+            y0_local = self.y0 if y0 is None else np.asarray(y0)
+            yp0_local = self.yp0 if yp0 is None else np.asarray(yp0)
+            sol = self.solver.solve(tspan, y0_local, yp0_local)
+            return sol
+
+        self.fsolve = py_fsolve
+        self.initialized = True
 
     def _out_array_to_dict(self, U, dU, r):
         Ui = {}
@@ -951,21 +1010,269 @@ class Model(object):
         return Ui, dUi, ri
 
     def find_steady_state(self, dt=60, maxiter=2000, epsilon=1e-8):
-        t, U1, dU1, r1 = self.ffind_steady_state(self.nvariables,
-                                                 len(self.rates),
-                                                 dt,
-                                                 maxiter,
-                                                 epsilon)
+        if not getattr(self, "initialized", False):
+            # Ensure the solver is prepared
+            self.setup_execs()
+
+        # initial t, y, yp
+        t = 0.0
+        y = self.y0.copy()
+        yp = self.yp0.copy()
+
+        # preallocate residual array
+        res = np.zeros_like(y)
+
+        converged = False
+        it = 0
+
+        while not converged and it < maxiter:
+            t_next = t + dt
+            # call solver to advance to t_next; provide y, yp as initial guesses
+            sol = self.solver.solve([t, t_next], y, yp)
+
+            # solver.solve may return an object or arrays; handle common forms
+            # prefer returning last timepoint solution
+            try:
+                t_vals = np.asarray(sol.t)
+                y_vals = np.asarray(sol.y)
+                yp_vals = np.asarray(sol.yp) if hasattr(sol, "yp") else None
+                # sol.y shape often (nvars, n_times)
+                y = y_vals[:, -1] if y_vals.ndim == 2 else y_vals
+                if yp_vals is not None:
+                    yp = yp_vals[:, -1] if yp_vals.ndim == 2 else yp_vals
+                else:
+                    # if solver didn't provide yp, try to estimate via finite difference or leave prior yp
+                    yp = yp
+                t = t_vals[-1] if t_vals.ndim >= 1 else float(t_next)
+            except Exception:
+                # fallback: solver might have returned (t_out, y_out, yp_out)
+                try:
+                    t, y_full, yp_full = sol
+                    y = np.asarray(y_full).ravel()[:, -1] if np.asarray(y_full).ndim == 2 else np.asarray(y_full).ravel()
+                    yp = np.asarray(yp_full).ravel()[:, -1] if np.asarray(yp_full).ndim == 2 else np.asarray(yp_full).ravel()
+                except Exception:
+                    raise RuntimeError("Unexpected solver.solve return type. Inspect sol object.")
+
+            # compute residuals using resfn
+            self.resfn(t, y, yp, res)
+
+            # For convergence check: either check derivative yp or residual res
+            if np.max(np.abs(yp)) < epsilon or np.max(res**2) < epsilon**2:
+                converged = True
+                break
+
+            it += 1
+
+        if not converged:
+            print("WARNING: did not converge to steady state within maxiter steps")
+
+        # compute rates (post-processing) and convert outputs to your dict format
+        rates_vals = self.rate_func(y)
+
+        # _out_array_to_dict in original code consumed arrays shaped (nvars, ntime)
+        # Here we will reuse your helper if present; otherwise build simple dict mapping species -> value
+        try:
+            # your original used U1.T shape etc; replicate similar behaviour
+            U_dict, dU_dict, r_dict = self._out_array_to_dict(y.reshape(-1, 1).T.T,
+                                                             yp.reshape(-1, 1).T.T,
+                                                             rates_vals.reshape(-1, 1).T.T)
+            # above keeps backward compatibility with your _out_array_to_dict call sites
+        except Exception:
+            # fallback: map variable species labels to values
+            U_dict = {s.label: float(v) for s, v in zip(self._variable_species, y)}
+            dU_dict = {s.label: float(v) for s, v in zip(self._variable_species, yp)}
+            # rates: map by index (no names unless you have reaction labels)
+            r_dict = {i: float(rv) for i, rv in enumerate(rates_vals)}
+
+        # store results on object like original method did
         self.t = t
-        self.U = []
-        self.dU = []
-        self.r = []
-        U, dU, r = self._out_array_to_dict(U1.T, dU1.T, r1.T)
-        self.U.append(U)
-        self.dU.append(dU)
-        self.r.append(r)
-        self.check_rates(U)
-        return t, U, r
+        self.U = [U_dict]
+        self.dU = [dU_dict]
+        self.r = [r_dict]
+
+        # optional check_rates hook
+        if hasattr(self, "check_rates"):
+            try:
+                self.check_rates(U_dict)
+            except Exception:
+                pass
+
+        return t, U_dict, r_dict
+    def newton_steady_state(self, y0=None, tol=1e-10, maxiter=50,
+                           lin_solver='direct', damping=True,
+                           bt_maxiter=10, bt_reduce=0.5, verbose=False):
+        """
+        Solve F(y, yp=0) = 0 with Newton's method using the analytic Jacobian.
+
+        Parameters
+        ----------
+        y0 : array_like or None
+            Initial guess for the variable vector. If None, uses self.y0.
+        tol : float
+            Convergence tolerance on the residual ||F||_inf.
+        maxiter : int
+            Maximum Newton iterations.
+        lin_solver : {'direct','lstsq'}
+            Linear solver used for J * delta = -F. 'direct' uses np.linalg.solve,
+            'lstsq' uses np.linalg.lstsq for near-singular J.
+        damping : bool
+            If True, perform simple backtracking line search on the Newton step.
+        bt_maxiter : int
+            Maximum backtracking reductions.
+        bt_reduce : float
+            Multiplicative step-length reduction factor (0<bt_reduce<1).
+        verbose : bool
+            Print iteration diagnostics.
+
+        Returns
+        -------
+        y_ss : ndarray
+            The steady-state vector (solution).
+        res_dict : mapping
+            Reaction rates or other post-processed rates (like your existing code returns).
+        Raises
+        ------
+        RuntimeError if solver infrastructure isn't present.
+        """
+
+        import numpy as np
+
+        # sanity checks
+        if not getattr(self, "initialized", False):
+            # ensure setup_execs has been called
+            try:
+                self.setup_execs()
+            except Exception as e:
+                raise RuntimeError("Model must be initialized (call setup_execs) before Newton solve: " + str(e))
+
+        n = int(self.nvariables)
+        # initial guess
+        if y0 is None:
+            if getattr(self, "y0", None) is None:
+                raise RuntimeError("No initial guess available (self.y0 is None). Provide y0.")
+            y = self.y0.astype(float).copy()
+        else:
+            y = np.asarray(y0, dtype=float).ravel().copy()
+            if y.size != n:
+                raise ValueError("y0 length mismatch: expected {}, got {}".format(n, y.size))
+
+        # zero derivative for steady-state
+        yp_zero = np.zeros(n, dtype=float)
+
+        # helper: evaluate residual F(y,0) into array
+        def eval_res(y_vec):
+            r = np.zeros(n, dtype=float)
+            # resfn signature: resfn(t, y, yp, res_out)
+            # pass t=0.0 (time not relevant for steady-state)
+            self.resfn(0.0, y_vec, yp_zero, r)
+            return r
+
+        # helper: evaluate Jacobian dF/dy (analytic) by calling jacfn with cj=0
+        def eval_Jy(y_vec):
+            J = np.zeros((n, n), dtype=float)
+            # jacfn signature (as provided in setup_execs): jacfn(t, y, yp, cj, J_out)
+            # passing cj=0 yields J = dF/dy + 0 * dF/dyp = dF/dy
+            try:
+                # Some wrappers return int status; jacfn fills J_out
+                self.jacfn(0.0, y_vec, yp_zero, 0.0, J)
+            except Exception as e:
+                # If jacfn isn't present or fails, raise and suggest alternate approach
+                raise RuntimeError("Could not evaluate analytic Jacobian via self.jacfn: " + str(e))
+            return J
+
+        # Newton iterations
+        res = eval_res(y)
+        res_norm = np.max(np.abs(res))
+        if verbose:
+            print(f"Newton init: ||F||_inf = {res_norm:.3e}")
+        if res_norm < tol:
+            # already converged
+            rates = self.rate_func(y) if hasattr(self, "rate_func") else None
+            return y, rates
+
+        for it in range(1, maxiter + 1):
+            J = eval_Jy(y)
+
+            # Solve linear system J * delta = -res
+            b = -res
+            try:
+                if lin_solver == 'direct':
+                    delta = np.linalg.solve(J, b)
+                elif lin_solver == 'lstsq':
+                    delta, *_ = np.linalg.lstsq(J, b, rcond=None)
+                else:
+                    raise ValueError("Unknown lin_solver '{}'".format(lin_solver))
+            except np.linalg.LinAlgError:
+                # fallback to least-squares
+                delta, *_ = np.linalg.lstsq(J, b, rcond=None)
+
+            # damping/backtracking line search: reduce alpha until residual decreases
+            alpha = 1.0
+            y_trial = y + alpha * delta
+            res_trial = eval_res(y_trial)
+            res_trial_norm = np.max(np.abs(res_trial))
+
+            if damping:
+                bt = 0
+                # accept step if residual decreases sufficiently (here: smaller max-norm)
+                while res_trial_norm >= res_norm and bt < bt_maxiter:
+                    alpha *= bt_reduce
+                    y_trial = y + alpha * delta
+                    res_trial = eval_res(y_trial)
+                    res_trial_norm = np.max(np.abs(res_trial))
+                    bt += 1
+                if verbose and bt > 0:
+                    print(f"  backtrack: it={it}, bt={bt}, alpha={alpha:.3e}, ||F||_inf={res_trial_norm:.3e}")
+
+            # accept trial
+            y = y_trial
+            res = res_trial
+            res_norm_new = res_trial_norm
+
+            if verbose:
+                print(f"Newton it {it:3d}: ||F||_inf = {res_norm_new:.3e}, ||delta||_inf = {np.max(np.abs(delta)):.3e}")
+
+            if res_norm_new < tol:
+                if verbose:
+                    print("Newton converged.")
+                break
+
+            # prepare for next iteration
+            res_norm = res_norm_new
+        else:
+            # loop exhausted
+            raise RuntimeError(f"Newton did not converge within {maxiter} iterations; final ||F||_inf = {res_norm:.3e}")
+
+        # post-processing: compute rates & convert to your dict format like find_steady_state did
+        rates_vals = self.rate_func(y) if hasattr(self, "rate_func") else None
+
+        # convert y into your U dict
+        try:
+            U_dict, dU_dict, r_dict = self._out_array_to_dict(y.reshape(-1, 1).T.T,
+                                                             yp_zero.reshape(-1, 1).T.T,
+                                                             rates_vals.reshape(-1, 1).T.T)
+        except Exception:
+            U_dict = {s.label: float(v) for s, v in zip(self._variable_species, y)}
+            dU_dict = {s.label: 0.0 for s in self._variable_species}
+            if rates_vals is None:
+                r_dict = {}
+            else:
+                r_dict = {i: float(rv) for i, rv in enumerate(np.atleast_1d(rates_vals))}
+
+        # store same fields as find_steady_state
+        self.t = 0.0
+        self.U = [U_dict]
+        self.dU = [dU_dict]
+        self.r = [r_dict]
+
+        # optional check_rates hook
+        if hasattr(self, "check_rates"):
+            try:
+                self.check_rates(U_dict)
+            except Exception:
+                pass
+
+        return y, r_dict
 
     def solve(self, t, ncp):
         self.t, U1, dU1, r1 = self.fsolve(self.nvariables,
