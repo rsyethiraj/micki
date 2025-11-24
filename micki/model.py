@@ -760,7 +760,7 @@ class Model(object):
             for j, symbol in enumerate(self.symbols):
                 self.drdy[i, j] = sym.diff(rate, symbol)
             for j, vac in enumerate(self.vacancy):
-                self.drdvac[i, j] = sym.diff(rate, vac.symbol
+                self.drdvac[i, j] = sym.diff(rate, vac.symbol)
                 
         # Convert to ordered initial arrays for SUNDAE
         self.y0 = np.array([self.U0[s.label] for s in self._variable_species])
