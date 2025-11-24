@@ -779,7 +779,7 @@ class Model(object):
         self.solver.set_id(algvar)
 
 
-        self.initialized = True
+#        self.initialized = True
 
     def setup_execs(self):
         from micki.fortran import f90_template, pyf_template
