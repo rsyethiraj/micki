@@ -57,6 +57,7 @@ def read_from_db(db, names=None, eref=None):
 
     for row in db.select():
         name = row.name
+        print(name)
         try:
             species[name] = row_to_thermo(row)
         except MickiDBReadError:
