@@ -926,11 +926,11 @@ class Model(object):
         created = False
         # Try passing jacfn in constructor first (some sksundae versions accept this)
         try:
-            self.solver = sun.ida.IDA(resfn=self.resfn, jacfn=self.jacfn, neq=n)
+            self.solver = sun.ida.IDA(resfn=self.resfn, jacfn=self.jacfn)
             created = True
         except Exception:
             try:
-                self.solver = sun.ida.IDA(resfn=self.resfn, neq=n)
+                self.solver = sun.ida.IDA(resfn=self.resfn)
                 created = True
                 # try to register jacfn via setter(s) if available
                 if hasattr(self.solver, "set_jacobian"):
