@@ -772,7 +772,6 @@ class Model(object):
 
         # Initialize SUNDAE solver object
         self.setup_execs()
-        self.solver = sun.ida.IDA()
         self.solver.init(self.resfn, 0.0, self.y0, self.yp0)
         self.solver.set_tolerances(self.rtol, self.atol)
 
